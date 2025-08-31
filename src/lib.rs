@@ -32,8 +32,44 @@ pub trait Pairing: Sized {
 #[derive(Default, Clone)]
 struct PlayerStats {
     points: u16,
-    opponents: Vec<usize>,
+    opponents: HashSet<usize>,
     games_played: usize,
+}
+
+struct PairingGraph {
+    weights: Vec<Vec<i32>>,
+    n: usize,
+}
+
+impl PairingGraph {
+    fn new(n: usize) -> Self {
+        Self {
+            weights: vec![vec![0; n]; n],
+            n,
+        }
+    }
+
+    fn set_weight(&mut self, i: usize, j: usize, weight: i32) {
+        assert!(i < self.n);
+        assert!(j < self.n);
+
+        self.weights[i][j] = weight;
+        self.weights[j][i] = weight;
+    }
+
+    fn get_weight(&self, i: usize, j: usize) -> i32 {
+        assert!(i < self.n);
+        assert!(j < self.n);
+
+        self.weights[i][j]
+    }
+
+    fn is_valid_pairing(&self, i: usize, j: usize) -> bool {
+        assert!(i < self.n);
+        assert!(j < self.n);
+
+        self.weights[i][j] > i32::MIN
+    }
 }
 
 #[derive(Default)]
@@ -53,6 +89,10 @@ impl<P: Player> SwissPairing<P> {
         M: Match<P = P>,
         O: Pairing<P = P>,
     {
+        if matches.is_empty() && round == 1 {
+            return self.initial_pairings(matches);
+        }
+
         let players = self.collect_players(matches);
         if players.is_empty() {
             return vec![];
@@ -66,9 +106,18 @@ impl<P: Player> SwissPairing<P> {
 
         let stats = self.calculate_stats(matches, &player_map);
         let graph = self.build_pairing_graph(&players, &stats);
-        let matching = self.maximum_weight_matching(&graph, players.len());
+
+        let matching = self.maximum_weight_matching(&graph, &stats);
 
         self.create_pairings_from_matching(&matching, &players, round)
+    }
+
+    fn initial_pairings<M, O>(&self, _matches: &[M]) -> Vec<O>
+    where
+        M: Match<P = P>,
+        O: Pairing<P = P>,
+    {
+        todo!()
     }
 
     fn collect_players<M>(&self, matches: &[M]) -> Vec<P>
@@ -83,7 +132,9 @@ impl<P: Player> SwissPairing<P> {
             }
         }
 
-        players.into_iter().collect()
+        let mut player_vec: Vec<P> = players.into_iter().collect();
+        player_vec.sort_by_key(|p| p.to_string());
+        player_vec
     }
 
     fn calculate_stats<M>(&self, matches: &[M], player_map: &HashMap<P, usize>) -> Vec<PlayerStats>
@@ -111,8 +162,8 @@ impl<P: Player> SwissPairing<P> {
 
                 stats[p1_idx].games_played += total_games;
                 stats[p2_idx].games_played += total_games;
-                stats[p1_idx].opponents.push(p2_idx);
-                stats[p2_idx].opponents.push(p1_idx);
+                stats[p1_idx].opponents.insert(p2_idx);
+                stats[p2_idx].opponents.insert(p1_idx);
 
                 if p1_wins > p2_wins {
                     stats[p1_idx].points += M::POINTS_PER_WIN;
@@ -128,39 +179,99 @@ impl<P: Player> SwissPairing<P> {
         stats
     }
 
-    fn build_pairing_graph(&self, players: &[P], stats: &[PlayerStats]) -> Vec<Vec<i32>> {
+    fn build_pairing_graph(&self, players: &[P], stats: &[PlayerStats]) -> PairingGraph {
         let n = players.len();
-        let mut graph = vec![vec![0i32; n]; n];
+        let mut graph = PairingGraph::new(n);
 
-        for i in 0..n {
-            for j in (i + 1)..n {
+        (0..n).for_each(|i| {
+            (i + 1..n).for_each(|j| {
                 if stats[i].opponents.contains(&j) {
-                    graph[i][j] = i32::MIN;
+                    graph.set_weight(i, j, i32::MIN);
                 } else {
                     // TODO: Tiebreakers
                     let point_diff = stats[i].points.abs_diff(stats[j].points);
-                    graph[i][j] = i32::from(1000 - point_diff * 100);
+                    let weight = i32::from(1000 - point_diff * 100);
+                    graph.set_weight(i, j, weight);
                 }
-                graph[j][i] = graph[i][j];
-            }
-        }
+            });
+        });
 
         graph
     }
 
-    fn maximum_weight_matching(&self, graph: &[Vec<i32>], n: usize) -> Vec<Option<usize>> {
+    fn maximum_weight_matching(
+        &self,
+        graph: &PairingGraph,
+        stats: &[PlayerStats],
+    ) -> Vec<Option<usize>> {
+        let n = graph.n;
+        let mut matching = vec![None; n];
+
+        let mut player_order: Vec<usize> = (0..n).collect();
+        player_order.sort_by_key(|&i| std::cmp::Reverse(stats[i].points));
+
+        if self.backtrack_matching(graph, &mut matching, &player_order, 0) {
+            return matching;
+        }
+
+        self.find_best_partial_matching(graph, stats)
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn backtrack_matching(
+        &self,
+        graph: &PairingGraph,
+        matching: &mut [Option<usize>],
+        player_order: &[usize],
+        idx: usize,
+    ) -> bool {
+        if idx >= player_order.len() {
+            return true;
+        }
+
+        let player = player_order[idx];
+
+        if matching[player].is_some() {
+            return self.backtrack_matching(graph, matching, player_order, idx + 1);
+        }
+
+        let mut candidates: Vec<(usize, i32)> = Vec::new();
+        (0..matching.len()).for_each(|j| {
+            if j != player && matching[j].is_none() && graph.is_valid_pairing(player, j) {
+                candidates.push((j, graph.get_weight(player, j)));
+            }
+        });
+
+        candidates.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+
+        for (j, _) in candidates {
+            matching[player] = Some(j);
+            matching[j] = Some(player);
+
+            if self.backtrack_matching(graph, matching, player_order, idx + 1) {
+                return true;
+            }
+
+            matching[player] = None;
+            matching[j] = None;
+        }
+
+        false
+    }
+
+    fn find_best_partial_matching(
+        &self,
+        graph: &PairingGraph,
+        stats: &[PlayerStats],
+    ) -> Vec<Option<usize>> {
+        let n = graph.n;
         let mut matching = vec![None; n];
         let mut used = vec![false; n];
 
-        let mut scores = vec![0i32; n];
-        for i in 0..n {
-            scores[i] = graph[i].iter().filter(|&&w| w > 0).sum();
-        }
+        let mut player_order: Vec<usize> = (0..n).collect();
+        player_order.sort_by_key(|&i| std::cmp::Reverse(stats[i].points));
 
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by_key(|&i| -scores[i]);
-
-        for &i in &indices {
+        for &i in &player_order {
             if used[i] {
                 continue;
             }
@@ -169,9 +280,12 @@ impl<P: Player> SwissPairing<P> {
             let mut best_weight = i32::MIN;
 
             (0..n).for_each(|j| {
-                if i != j && !used[j] && graph[i][j] > best_weight {
-                    best_weight = graph[i][j];
-                    best_j = Some(j);
+                if i != j && !used[j] && graph.is_valid_pairing(i, j) {
+                    let weight = graph.get_weight(i, j);
+                    if weight > best_weight {
+                        best_weight = weight;
+                        best_j = Some(j);
+                    }
                 }
             });
 
@@ -215,7 +329,6 @@ impl<P: Player> SwissPairing<P> {
                 }
             }
         }
-
         pairings
     }
 }
@@ -315,59 +428,64 @@ mod tests {
         "Anna", "Bella", "Charlie", "Donovan", "Emil", "Fae", "Gulliver", "Heino",
     ];
 
+    fn random_match_result() -> (u8, u8) {
+        use std::collections::hash_map::RandomState;
+        use std::hash::BuildHasher;
+
+        let random = RandomState::new().hash_one(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+
+        match random % 10 {
+            0 => (2, 0),
+            1 => (2, 1),
+            2 => (0, 2),
+            3 => (1, 2),
+            4 => (1, 1),
+            5 => (0, 0),
+            6 => (2, 0),
+            7 => (2, 1),
+            8 => (0, 2),
+            9 => (1, 2),
+            _ => unreachable!(),
+        }
+    }
+
     #[test]
     fn test_initial_pairing_and_second_round() {
         let pairing_engine = SwissPairing::<SimplePlayer>::new();
 
         // 8 players for a Magic draft pod
-        let players: Vec<SimplePlayer> =
-            (TEST_PLAYERS).map(|p| SimplePlayer(p.to_string())).to_vec();
+        let players: Vec<SimplePlayer> = TEST_PLAYERS
+            .iter()
+            .map(|p| SimplePlayer(p.to_string()))
+            .collect();
 
-        let game1: SimpleMatch<SimplePlayer> = SimpleMatch {
-            player1: players[0].clone(),
-            player2: Some(players[1].clone()),
-            player1_wins: Some(2),
-            player2_wins: Some(0),
-            is_bye: false,
-            round: 1,
-        };
+        let mut round1_matches: Vec<SimpleMatch<SimplePlayer>> = Vec::with_capacity(4);
 
-        let game2: SimpleMatch<SimplePlayer> = SimpleMatch {
-            player1: players[2].clone(),
-            player2: Some(players[3].clone()),
-            player1_wins: Some(2),
-            player2_wins: Some(1),
-            is_bye: false,
-            round: 1,
-        };
+        (0..4).for_each(|i| {
+            let (p1_wins, p2_wins) = random_match_result();
+            round1_matches.push(SimpleMatch {
+                player1: players[i * 2].clone(),
+                player2: Some(players[i * 2 + 1].clone()),
+                player1_wins: Some(p1_wins),
+                player2_wins: Some(p2_wins),
+                is_bye: false,
+                round: 1,
+            });
+        });
 
-        let game3: SimpleMatch<SimplePlayer> = SimpleMatch {
-            player1: players[4].clone(),
-            player2: Some(players[5].clone()),
-            player1_wins: Some(1),
-            player2_wins: Some(2),
-            is_bye: false,
-            round: 1,
-        };
-
-        let game4: SimpleMatch<SimplePlayer> = SimpleMatch {
-            player1: players[6].clone(),
-            player2: Some(players[7].clone()),
-            player1_wins: Some(2),
-            player2_wins: Some(0),
-            is_bye: false,
-            round: 1,
-        };
-
-        let round1_matches = vec![game1, game2, game3, game4];
-
-        println!("Round 1 Pairings:");
+        println!("Round 1 Results:");
         for game in &round1_matches {
             println!("{game}");
         }
 
         let mut round2_pairings: Vec<SimpleMatch<SimplePlayer>> =
             pairing_engine.pair(&round1_matches, 2);
+
         assert_eq!(round2_pairings.len(), 4);
 
         // Check that players are not paired against previous opponents
@@ -403,8 +521,10 @@ mod tests {
             println!("{game}");
         }
 
-        let round3_pairings: Vec<SimpleMatch<SimplePlayer>> =
-            pairing_engine.pair(&round2_pairings, 3);
+        let mut all_matches = round1_matches.clone();
+        all_matches.extend(round2_pairings);
+
+        let round3_pairings: Vec<SimpleMatch<SimplePlayer>> = pairing_engine.pair(&all_matches, 3);
 
         println!("Round 3 Pairings:");
         for game in &round3_pairings {
@@ -425,6 +545,72 @@ mod tests {
                     "Players {:?} and {:?} already played",
                     game.player1, p2
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_odd_number_of_players() {
+        let pairing_engine = SwissPairing::<SimplePlayer>::new();
+
+        // 7 players - one will get a bye
+        let players: Vec<SimplePlayer> = TEST_PLAYERS[..7]
+            .iter()
+            .map(|p| SimplePlayer(p.to_string()))
+            .collect();
+
+        let mut matches = vec![];
+
+        // Create round 1 results with random outcomes
+        for i in 0..3 {
+            let (p1_wins, p2_wins) = random_match_result();
+            matches.push(SimpleMatch {
+                player1: players[i * 2].clone(),
+                player2: Some(players[i * 2 + 1].clone()),
+                player1_wins: Some(p1_wins),
+                player2_wins: Some(p2_wins),
+                is_bye: false,
+                round: 1,
+            });
+        }
+
+        // Player 7 gets a bye
+        matches.push(SimpleMatch {
+            player1: players[6].clone(),
+            player2: None,
+            player1_wins: None,
+            player2_wins: None,
+            is_bye: true,
+            round: 1,
+        });
+
+        println!("Round 1 Results (7 players):");
+        for game in &matches {
+            println!("  {}", game);
+        }
+
+        let round2_pairings: Vec<SimpleMatch<SimplePlayer>> = pairing_engine.pair(&matches, 2);
+
+        println!("\nRound 2 Pairings:");
+        for game in &round2_pairings {
+            println!("  {}", game);
+        }
+
+        // Should have 4 pairings (3 matches + 1 bye)
+        assert_eq!(round2_pairings.len(), 4);
+
+        // Exactly one bye
+        let bye_count = round2_pairings.iter().filter(|m| m.is_bye).count();
+        assert_eq!(bye_count, 1);
+
+        // No repeat pairings
+        for game in &round2_pairings {
+            if let Some(p2) = &game.player2 {
+                let played_before = matches.iter().any(|m| {
+                    (m.player1 == game.player1 && m.player2.as_ref() == Some(p2))
+                        || (m.player1 == *p2 && m.player2.as_ref() == Some(&game.player1))
+                });
+                assert!(!played_before);
             }
         }
     }
