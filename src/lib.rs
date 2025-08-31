@@ -298,7 +298,7 @@ mod tests {
         type P = P;
 
         fn new(player1: P, player2: Option<P>, round: usize) -> Self {
-            let is_bye = player2.is_some();
+            let is_bye = player2.is_none();
 
             Self {
                 player1,
